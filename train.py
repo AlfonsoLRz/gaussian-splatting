@@ -41,6 +41,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    print(opt.position_lr_init, opt.position_lr_final, opt.iterations)
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -63,8 +64,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
-    viewpoint_indices = list(range(len(viewpoint_stack)))
+    bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+    # This is something new: we need to give more weight to cameras where visibility is low
+    if opt.visibility_weighting:
+        raw_visibility_scores = torch.zeros(len(scene.getTrainCameras()), device="cuda")
+        for idx, viewpoint in enumerate(scene.getTrainCameras()):
+            render_pkg = render(viewpoint, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+            visibility_filter = render_pkg["visibility_filter"]
+            # Invert the score so lower visibility results in a HIGHER effective weight
+            # Add a small epsilon to avoid division by zero or huge weights for empty views
+            ratio = visibility_filter.numel() / gaussians._opacity.numel() + 1e-6
+            raw_visibility_scores[idx] = 1.0 / (ratio**10.0)
+
+        camera_sampling_probabilities = raw_visibility_scores / raw_visibility_scores.sum()
+        print(camera_sampling_probabilities)
+
+        visibility_weights = torch.ones(len(scene.getTrainCameras()), device="cuda")
+        for idx, viewpoint in enumerate(scene.getTrainCameras().copy()):
+            render_pkg = render(viewpoint, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+            visibility_filter = render_pkg["visibility_filter"]
+            visibility_weights[idx] = visibility_filter.numel() / gaussians._opacity.numel()
+        visibility_weights = visibility_weights / visibility_weights.mean()
+
+        viewpoint_stack_copy, viewpoint_indices_copy = [], []
+        for idx, viewpoint in enumerate(scene.getTrainCameras().copy()):
+            viewpoint.visibility_weight = visibility_weights[idx]
+            if visibility_weights[idx] < 1:
+                viewpoint_stack_copy.extend([viewpoint] * 2)
+                viewpoint_indices_copy.extend([idx] * 2)
+            else:
+                viewpoint_stack_copy.extend([viewpoint])
+                viewpoint_indices_copy.extend([idx])
+    else:
+        viewpoint_stack_copy = scene.getTrainCameras().copy()
+        viewpoint_indices_copy = list(range(len(viewpoint_stack_copy)))
+
+    viewpoint_stack = viewpoint_stack_copy.copy()
+    viewpoint_indices = viewpoint_indices_copy.copy()
+
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
@@ -96,8 +136,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
+            viewpoint_stack = viewpoint_stack_copy.copy()
+            viewpoint_indices = viewpoint_indices_copy.copy()
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
@@ -105,8 +145,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -126,7 +164,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
-        Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
@@ -168,8 +205,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.015, scene.cameras_extent, size_threshold, radii)
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -185,7 +222,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
+            # Delete gaussian that are not visible in more than three viewpoints
+            if iteration % 100 == 0:
+                visibility_count = torch.zeros(gaussians._opacity.numel(), dtype=torch.int32, device="cuda")
+
+                for view in scene.getTrainCameras().copy():
+                    render_pkg = render(view, gaussians, pipe, bg, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
+                    visibility_filter = render_pkg["visibility_filter"]
+                    visibility_count[visibility_filter] += 1
+
+                mask = visibility_count < len(scene.getTrainCameras()) * 0.3
+                if mask.any():
+                    gaussians.prune(mask)
+
+            if iteration in checkpoint_iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 

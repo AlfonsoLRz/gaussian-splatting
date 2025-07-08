@@ -19,13 +19,15 @@ WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
+    if not image.mode.startswith('RGB'):
+        image = image.convert('RGB')
 
     if cam_info.depth_path != "":
         try:
             if is_nerf_synthetic:
                 invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / 512
             else:
-                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
+                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / 255.0
 
         except FileNotFoundError:
             print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
